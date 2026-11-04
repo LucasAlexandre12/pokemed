@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import type { Session } from '@supabase/supabase-js';
+import { isSupabaseConfigured, supabase } from './supabaseClient';
 
 // --- DATA STRUCTURES e INITIAL MOCK DATA ---
 
@@ -347,6 +349,10 @@ function writeStoredValue(key, value) {
 
 // --- MAIN APPLICATION COMPONENT ---
 export default function App() {
+  const [session, setSession] = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [cloudReady, setCloudReady] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('Conectando...');
   const [activeTab, setActiveTab] = useState('dashboard');
   const [theme, setTheme] = useState(() => {
     try { return typeof window !== 'undefined' ? (window.localStorage.getItem('pokemed_theme') || 'dark') : 'dark'; }
@@ -359,6 +365,69 @@ export default function App() {
   const [questions, setQuestions] = useState(() => readStoredValue('pokemed_questions', INITIAL_QUESTIONS));
   const [flashcards, setFlashcards] = useState(() => readStoredValue('pokemed_flashcards', INITIAL_FLASHCARDS));
   const [cadernoEntries, setCadernoEntries] = useState(() => readStoredValue('pokemed_caderno', INITIAL_CADERNO_ENTRIES));
+
+  // Autenticação Supabase: cada conta acessa apenas a própria linha protegida por RLS.
+  useEffect(() => {
+    if (!supabase) { setAuthLoading(false); return; }
+    let alive = true;
+    supabase.auth.getSession().then(({ data, error }) => {
+      if (!alive) return;
+      if (error) console.error('Falha ao recuperar sessão:', error);
+      setSession(data.session);
+      setAuthLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+      if (!nextSession) { setCloudReady(false); setSyncStatus('Desconectado'); }
+    });
+    return () => { alive = false; listener.subscription.unsubscribe(); };
+  }, []);
+
+  // Ao entrar, restaura a cópia da nuvem. No primeiro acesso, migra o conteúdo local existente.
+  useEffect(() => {
+    if (!supabase || !session?.user?.id) return;
+    let cancelled = false;
+    setCloudReady(false);
+    setSyncStatus('Carregando seus dados...');
+    (async () => {
+      const { data, error } = await supabase!.from('user_app_data').select('data').eq('user_id', session.user.id).maybeSingle();
+      if (cancelled) return;
+      if (error) { console.error(error); setSyncStatus('Erro ao carregar nuvem'); setCloudReady(false); return; }
+      if (data?.data) {
+        const cloud = data.data;
+        if (Array.isArray(cloud.logs)) setLogs(cloud.logs);
+        if (Array.isArray(cloud.questions)) setQuestions(cloud.questions);
+        if (Array.isArray(cloud.flashcards)) setFlashcards(cloud.flashcards);
+        if (Array.isArray(cloud.cadernoEntries)) setCadernoEntries(cloud.cadernoEntries);
+        if (cloud.theme === 'dark' || cloud.theme === 'light') setTheme(cloud.theme);
+      } else {
+        const initialData = {
+          logs: readStoredValue('pokemed_logs', INITIAL_LOGS),
+          questions: readStoredValue('pokemed_questions', INITIAL_QUESTIONS),
+          flashcards: readStoredValue('pokemed_flashcards', INITIAL_FLASHCARDS),
+          cadernoEntries: readStoredValue('pokemed_caderno', INITIAL_CADERNO_ENTRIES),
+          theme: window.localStorage.getItem('pokemed_theme') || 'dark',
+        };
+        const { error: saveError } = await supabase!.from('user_app_data').upsert({ user_id: session.user.id, data: initialData, updated_at: new Date().toISOString() });
+        if (saveError) { console.error(saveError); setSyncStatus('Erro ao migrar dados'); return; }
+      }
+      if (!cancelled) { setCloudReady(true); setSyncStatus('Sincronizado'); }
+    })();
+    return () => { cancelled = true; };
+  }, [session?.user?.id]);
+
+  // Salva localmente e sincroniza automaticamente após a restauração inicial.
+  useEffect(() => {
+    if (!supabase || !session?.user?.id || !cloudReady) return;
+    const timer = window.setTimeout(async () => {
+      setSyncStatus('Sincronizando...');
+      const payload = { logs, questions, flashcards, cadernoEntries, theme };
+      const { error } = await supabase!.from('user_app_data').upsert({ user_id: session.user.id, data: payload, updated_at: new Date().toISOString() });
+      setSyncStatus(error ? 'Falha na sincronização' : 'Sincronizado');
+      if (error) console.error('Erro na sincronização:', error);
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [session?.user?.id, cloudReady, logs, questions, flashcards, cadernoEntries, theme]);
 
   // Salva automaticamente as alterações no navegador.
   useEffect(() => {
@@ -449,6 +518,11 @@ export default function App() {
 
   const isDark = theme === 'dark';
 
+  if (!isSupabaseConfigured) return <ConfigurationRequired />;
+  if (authLoading) return <AuthLoading />;
+  if (window.location.hash.includes('type=recovery') && session) return <PasswordRecovery />;
+  if (!session) return <AuthScreen />;
+
   return (
     <div className={`min-h-screen font-sans antialiased selection:bg-emerald-500 selection:text-white transition-colors duration-300 ${
       isDark ? 'bg-slate-950 text-slate-100' : 'bg-slate-50 text-slate-800'
@@ -496,6 +570,8 @@ export default function App() {
             {isDark ? <IconSun /> : <IconMoon />}
           </button>
 
+          <span className="hidden lg:inline text-[10px] font-semibold text-slate-400">{syncStatus}</span>
+          <button onClick={() => supabase?.auth.signOut()} className="text-xs font-bold px-3 py-2 rounded-xl border border-slate-700/40 hover:bg-slate-800/40">Sair</button>
           <button
             onClick={() => setActiveTab('add')}
             className="hidden sm:flex items-center space-x-2 bg-gradient-to-r from-emerald-600 to-sky-600 hover:from-emerald-500 hover:to-sky-500 text-white text-xs font-bold px-4 py-2 rounded-xl transition shadow-md shadow-emerald-600/20 active:scale-95"
@@ -710,6 +786,16 @@ export default function App() {
               flashcards={flashcards}
               cadernoEntries={cadernoEntries}
               onResetProgress={resetProgress}
+              onExportBackup={handleExportBackup}
+              onImportBackup={(backup) => {
+                if (!backup || !Array.isArray(backup.questions) || !Array.isArray(backup.flashcards) || !Array.isArray(backup.cadernoEntries)) {
+                  showToast('Arquivo de backup inválido ou incompleto.'); return;
+                }
+                if (!window.confirm('Restaurar este backup substituirá os dados atuais desta conta. Deseja continuar?')) return;
+                if (Array.isArray(backup.logs)) setLogs(backup.logs); setQuestions(backup.questions); setFlashcards(backup.flashcards); setCadernoEntries(backup.cadernoEntries);
+                if (backup.theme === 'dark' || backup.theme === 'light') setTheme(backup.theme);
+                showToast('Backup restaurado. A sincronização será atualizada.');
+              }}
             />
           )}
         </main>
@@ -718,10 +804,57 @@ export default function App() {
   );
 }
 
+
+function AuthLoading() { return <div className="min-h-screen bg-slate-950 text-white grid place-items-center"><p className="text-sm text-slate-300">Carregando PokeMed...</p></div>; }
+function ConfigurationRequired() { return <div className="min-h-screen bg-slate-950 text-white grid place-items-center p-6"><div className="max-w-md text-center space-y-3"><h1 className="text-3xl font-black">PokeMed</h1><p className="text-slate-300 text-sm">A integração com o Supabase ainda não foi configurada no ambiente de publicação.</p><p className="text-xs text-slate-500">Configure VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY nas variáveis de ambiente da Vercel e faça um novo deploy.</p></div></div>; }
+function PasswordRecovery() {
+  const [password, setPassword] = useState(''); const [message, setMessage] = useState(''); const [busy, setBusy] = useState(false);
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault(); if (!supabase) return; setBusy(true); setMessage('');
+    const { error } = await supabase.auth.updateUser({ password });
+    setBusy(false);
+    if (error) setMessage(error.message);
+    else { window.history.replaceState({}, document.title, window.location.pathname); setMessage('Senha atualizada. Recarregue a página para entrar.'); await supabase.auth.signOut(); }
+  };
+  return <div className="min-h-screen bg-slate-950 text-slate-100 grid place-items-center p-5"><form onSubmit={submit} className="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-900 p-7 space-y-4"><h1 className="text-xl font-extrabold">Criar nova senha</h1><label className="block text-xs font-bold">Nova senha<input type="password" minLength={6} required value={password} onChange={e=>setPassword(e.target.value)} className="mt-1 w-full rounded-xl bg-slate-950 border border-slate-700 p-3 text-sm" /></label><button disabled={busy} className="w-full rounded-xl bg-emerald-600 py-3 font-bold text-sm">{busy?'Salvando...':'Atualizar senha'}</button>{message && <p className="text-xs text-emerald-300">{message}</p>}</form></div>;
+}
+
+function AuthScreen() {
+  const [mode, setMode] = useState<'login' | 'signup' | 'reset'>('login');
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
+  const [message, setMessage] = useState(''); const [busy, setBusy] = useState(false);
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault(); if (!supabase) return; setBusy(true); setMessage('');
+    try {
+      if (mode === 'signup') {
+        const { error } = await supabase.auth.signUp({ email, password, options: { emailRedirectTo: window.location.origin } });
+        if (error) throw error; setMessage('Conta criada. Verifique seu e-mail para confirmar o cadastro.');
+      } else if (mode === 'reset') {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/` });
+        if (error) throw error; setMessage('Enviamos um link de redefinição para seu e-mail.');
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+    } catch (error: any) { setMessage(error?.message || 'Não foi possível concluir. Tente novamente.'); }
+    finally { setBusy(false); }
+  };
+  return <div className="min-h-screen bg-slate-950 text-slate-100 grid place-items-center p-5"><div className="w-full max-w-md rounded-3xl border border-slate-800 bg-slate-900 p-7 shadow-2xl"><div className="text-center mb-7"><div className="text-3xl font-black tracking-tight">Poke<span className="text-emerald-400">Med</span></div><p className="text-xs text-slate-400 mt-2">Sua rotina de estudos, em qualquer dispositivo.</p></div><h1 className="text-xl font-extrabold mb-1">{mode === 'login' ? 'Entrar na sua conta' : mode === 'signup' ? 'Criar sua conta' : 'Recuperar senha'}</h1><p className="text-xs text-slate-400 mb-5">{mode === 'reset' ? 'Informe seu e-mail para receber o link de redefinição.' : 'Acesse seu espaço pessoal de estudos.'}</p><form onSubmit={submit} className="space-y-3"><label className="block text-xs font-bold text-slate-300">E-mail<input type="email" required value={email} onChange={e=>setEmail(e.target.value)} className="mt-1 w-full rounded-xl bg-slate-950 border border-slate-700 p-3 text-sm outline-none focus:border-emerald-500" placeholder="seu@email.com" /></label>{mode !== 'reset' && <label className="block text-xs font-bold text-slate-300">Senha<input type="password" required minLength={6} value={password} onChange={e=>setPassword(e.target.value)} className="mt-1 w-full rounded-xl bg-slate-950 border border-slate-700 p-3 text-sm outline-none focus:border-emerald-500" placeholder="Mínimo de 6 caracteres" /></label>}<button disabled={busy} className="w-full rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 py-3 font-extrabold text-sm">{busy ? 'Aguarde...' : mode === 'login' ? 'Entrar' : mode === 'signup' ? 'Criar conta' : 'Enviar link'}</button></form>{message && <p className="mt-4 text-xs text-emerald-300 break-words">{message}</p>}<div className="mt-5 flex flex-wrap justify-between gap-3 text-xs"><button onClick={()=>{setMode(mode==='login'?'signup':'login');setMessage('');}} className="text-emerald-400 font-bold">{mode==='login'?'Criar conta': 'Voltar ao login'}</button>{mode==='login' && <button onClick={()=>{setMode('reset');setMessage('');}} className="text-slate-400 hover:text-white">Esqueci minha senha</button>}</div></div></div>;
+}
+
 // ==========================================
 // CONFIGURAÇÕES
 // ==========================================
-function SettingsView({ isDark, logs, questions, flashcards, cadernoEntries, onResetProgress }) {
+function SettingsView({ isDark, logs, questions, flashcards, cadernoEntries, onResetProgress, onExportBackup, onImportBackup }) {
+  const [backupError, setBackupError] = useState('');
+  const handleBackupFile = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => { try { onImportBackup(JSON.parse(String(reader.result))); setBackupError(''); } catch { setBackupError('Não foi possível ler esse arquivo JSON.'); } };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
   const cardBg = isDark ? 'bg-slate-900/90 border-slate-800' : 'bg-white border-emerald-100 shadow-sm';
   const textTitle = isDark ? 'text-white' : 'text-slate-900';
 
@@ -771,11 +904,11 @@ function SettingsView({ isDark, logs, questions, flashcards, cadernoEntries, onR
         </button>
       </div>
 
-      <div className={`p-5 rounded-2xl border ${cardBg}`}>
-        <h3 className={`text-sm font-extrabold ${textTitle}`}>Onde seus dados ficam salvos?</h3>
-        <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-          Por enquanto, os dados ficam armazenados neste navegador e neste dispositivo. Limpar os dados do navegador pode apagá-los. A publicação do site, por si só, não cria uma conta nem sincroniza os dados entre dispositivos.
-        </p>
+      <div className={`p-5 rounded-2xl border space-y-3 ${cardBg}`}>
+        <div><h3 className={`text-sm font-extrabold ${textTitle}`}>Backup e restauração</h3><p className="text-xs text-slate-400 mt-1">Exporte todo o conteúdo, histórico, métricas e preferências ou restaure um backup anterior.</p></div>
+        <button type="button" onClick={onExportBackup} className="w-full sm:w-auto px-5 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-extrabold">Baixar backup completo</button>
+        <div><label className="block text-xs font-bold text-slate-400 mb-2">Restaurar arquivo de backup (.json)</label><input type="file" accept="application/json,.json" onChange={handleBackupFile} className="block w-full text-xs text-slate-400" />{backupError && <p className="text-xs text-rose-400 mt-2">{backupError}</p>}</div>
+        <p className="text-[11px] text-slate-500">Os dados são sincronizados com sua conta Supabase e protegidos por políticas de acesso por usuário. Mantenha também uma cópia de backup própria.</p>
       </div>
     </div>
   );
@@ -2036,6 +2169,10 @@ function AddContentView({ isDark, questions, flashcards, cadernoEntries, setQues
 
   const handleExportBackup = () => {
     const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify({
+      version: 2,
+      exportedAt: new Date().toISOString(),
+      theme,
+      logs,
       questions,
       flashcards,
       cadernoEntries
