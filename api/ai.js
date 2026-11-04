@@ -5,17 +5,18 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.status(503).json({ error: 'A integração de IA ainda não foi configurada no servidor.' });
+    return res.status(503).json({ error: 'A integração de IA ainda não foi configurada no servidor. Cadastre GEMINI_API_KEY na Vercel.' });
   }
 
   const query = String(req.body?.query || '').trim();
   const source = String(req.body?.source || 'Diretrizes Médicas').trim();
   if (!query) return res.status(400).json({ error: 'Digite uma dúvida antes de consultar.' });
 
-  const systemPrompt = `Você é o assistente clínico educacional da plataforma PokeMed, voltada ao estudo para provas de residência médica no Brasil. Priorize a referência indicada pelo usuário: ${source}. Estruture a resposta com definição, critérios diagnósticos e sinais de alarme, conduta terapêutica com doses quando houver segurança e pegadinhas de prova. Diferencie recomendações de diretrizes e não invente referências. Quando não tiver certeza, deixe isso explícito. A resposta é material educacional e não substitui avaliação médica.`;
+  const systemPrompt = `Você é o assistente clínico educacional da plataforma PokeMed, voltada ao estudo para provas de residência médica no Brasil. Priorize a referência indicada pelo usuário: ${source}. Estruture a resposta com definição, critérios diagnósticos e sinais de alarme, conduta terapêutica com doses quando houver segurança e pegadinhas de prova. Diferencie recomendações de diretrizes e não invente referências. Quando não tiver certeza, deixe isso explícito. Não utilize formatação em código TeX/LaTeX para símbolos matemáticos ou de comparação (use caracteres diretos como ≥, ≤). A resposta é material educacional e não substitui avaliação médica.`;
 
   try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    // Ajustado para gemini-1.5-flash (modelo correto e funcional)
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -26,9 +27,12 @@ export default async function handler(req, res) {
 
     const data = await response.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
     if (!response.ok || !text) {
+      console.error('Resposta de erro da API Gemini:', data);
       return res.status(502).json({ error: 'A IA não conseguiu responder agora. Tente novamente.' });
     }
+
     return res.status(200).json({ text });
   } catch (error) {
     console.error('Erro na integração Gemini:', error);
